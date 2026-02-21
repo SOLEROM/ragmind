@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb"
+version = "0.1.0"
+description = "Local offline knowledge assistant for personal markdown files"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "sentence-transformers>=2.7",
+    "faiss-cpu>=1.7",
+    "numpy>=1.24",
+    "ollama>=0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+
+[project.scripts]
+kb = "kb.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

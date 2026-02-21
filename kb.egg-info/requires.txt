@@ -1,0 +1,9 @@
+click>=8.1
+sentence-transformers>=2.7
+faiss-cpu>=1.7
+numpy>=1.24
+ollama>=0.2
+
+[dev]
+pytest>=8.0
+pytest-mock>=3.12
