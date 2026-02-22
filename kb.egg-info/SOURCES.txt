@@ -3,6 +3,7 @@ pyproject.toml
 kb/__init__.py
 kb/chunker.py
 kb/cli.py
+kb/daemon.py
 kb/embedder.py
 kb/generator.py
 kb/retriever.py

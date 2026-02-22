@@ -12,6 +12,10 @@ answer with source citations.
 ## How it works
 
 ```
+DEFAULT_LLM_MODEL in kb/cli.py:25
+```
+
+```
 Your markdown files
         │
         ▼
