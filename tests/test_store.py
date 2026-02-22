@@ -123,8 +123,10 @@ def test_incremental_update_old_chunks_gone(store):
     ]
     store.add_file("a.md", 2.0, new_chunks, new_vecs)
 
-    all_content = [c.content for c in store._chunks if c is not None]
-    assert all("Brand new content" in c for c in all_content)
+    # Only the new chunks should be retrievable via the public search API.
+    assert store.total_chunks == 3
+    results = store.search(new_vecs[0], top_k=10)
+    assert all("Brand new content" in chunk.content for chunk, _ in results)
 
 
 # ---------------------------------------------------------------------------

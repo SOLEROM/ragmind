@@ -32,7 +32,11 @@ Your markdown files
   Your question
         │
         ▼
-  [ Embedder ] ──  embeds the question
+  [ Daemon? ]  ──  if `kb serve` is running, the warm embedder is reused
+        │           (skips the 2-5 s model cold-start); otherwise falls
+        │           through to the direct path below
+        ▼
+  [ Embedder ] ──  embeds the question (lazy: model loaded on first use)
         │
         ▼
   [ Store ]    ──  nearest-neighbour search → top-k relevant chunks
@@ -93,6 +97,13 @@ kb query "how do I set up SSH key authentication?"
 kb status
 ```
 
+For faster repeated queries, start the warm-embedder daemon first:
+
+```bash
+kb serve &
+kb query "how do I set up SSH key authentication?"   # no cold-start delay
+```
+
 ---
 
 ## Commands
@@ -118,6 +129,8 @@ kb index ~/notes --embed-model sentence-transformers/all-mpnet-base-v2
 ### `kb query "<question>"`
 
 Retrieves the most relevant chunks from the index and generates an answer.
+If `kb serve` is running, the request is forwarded to the daemon (no
+cold-start cost). Otherwise the command runs the full pipeline in-process.
 
 ```
 kb query "what is the project deadline?"
@@ -149,6 +162,41 @@ Sources:
   - docs/setup.md > # Setup > ## Environment Variables
   - notes/ops.md > # Operations > ## Troubleshooting
 ```
+
+---
+
+### `kb serve`
+
+Starts a long-running daemon that keeps the embedding model in memory.
+While the daemon is running, every `kb query` call skips the 2–5 s
+model cold-start and returns results significantly faster.
+
+```
+kb serve                                         # foreground
+kb serve --embed-model all-mpnet-base-v2         # non-default model
+kb --store /data/my-kb serve                     # non-default store
+```
+
+The daemon prints its socket path and PID on startup:
+
+```
+kb daemon ready  (pid 12345)
+  socket : /home/user/.kb/store/daemon.sock
+  model  : all-MiniLM-L6-v2
+  store  : /home/user/.kb/store
+Press Ctrl-C to stop.
+```
+
+`kb query` detects the daemon automatically (via the socket file) and
+uses it transparently. If the daemon is not running, `kb query` falls
+back to direct mode without any configuration change needed.
+
+The daemon also watches for store changes: if `kb index` runs while the
+daemon is up, the next query automatically reloads the FAISS index.
+
+| Option | Default | Description |
+|---|---|---|
+| `--embed-model` | `all-MiniLM-L6-v2` | Must match the model used during index |
 
 ---
 
@@ -191,6 +239,24 @@ kb query "..."
 
 ---
 
+## Performance
+
+Each `kb query` invocation is a short-lived process.  Without the daemon
+the dominant cost is loading the sentence-transformer model (~80 MB of
+weights) from disk on every call.  Several optimisations are in place to
+minimise this:
+
+| Optimisation | Effect |
+|---|---|
+| **Lazy model loading** | The embedder object is constructed immediately but model weights are only loaded when the first `embed()` call is made. A query on an empty store never loads the model at all. |
+| **Embedding dimension cached in store** | `kb query` reads the stored `embedding_dim` from `meta.json` instead of loading the model just to discover the vector size. |
+| **O(1) chunk counter** | `total_chunks` is maintained as an integer rather than scanning the full chunk list on every call. |
+| **Lazy chunk deserialisation** | Chunks are kept as raw JSON dicts after `load()` and converted to `Chunk` objects only for the top-k results actually returned by FAISS. |
+| **Smart FAISS over-fetch** | The index only fetches `top_k × 5` candidates (to compensate for deleted slots) when files have actually been removed. Clean indexes fetch exactly `top_k`. |
+| **Warm-embedder daemon** | `kb serve` keeps the model in memory permanently. Queries routed through the daemon pay zero model-load cost. |
+
+---
+
 ## Running the tests
 
 ```bash
@@ -203,7 +269,7 @@ in under a second without a GPU, without Ollama, and without downloading any
 model weights.
 
 ```
-68 passed in 0.19s
+68 passed in 0.27s
 ```
 
 ---
@@ -215,11 +281,12 @@ kb/
 ├── kb/
 │   ├── scanner.py      # find .md files
 │   ├── chunker.py      # split by markdown headers → Chunk objects
-│   ├── embedder.py     # BaseEmbedder + SentenceTransformerEmbedder
+│   ├── embedder.py     # BaseEmbedder + SentenceTransformerEmbedder (lazy load)
 │   ├── store.py        # FAISS vector store + JSON metadata + save/load
 │   ├── retriever.py    # embed query, search store, return top-k chunks
 │   ├── generator.py    # build RAG prompt, call LLM, return answer
-│   └── cli.py          # Click CLI (index / query / status)
+│   ├── daemon.py       # warm-embedder daemon (Unix socket server)
+│   └── cli.py          # Click CLI (index / query / status / serve)
 └── tests/
     ├── mocks.py        # MockEmbedder (deterministic) + MockLLM
     ├── conftest.py     # shared fixtures

@@ -25,17 +25,32 @@ class BaseEmbedder(ABC):
 
 
 class SentenceTransformerEmbedder(BaseEmbedder):
-    """Wraps a ``sentence-transformers`` model for local embedding."""
+    """Wraps a ``sentence-transformers`` model for local embedding.
+
+    The underlying model is loaded lazily on the first call to
+    :meth:`embed` or :attr:`dim`, so constructing this object is cheap
+    and does *not* pay the 2–5 s model-load cost up front.  The model
+    is loaded at most once per process lifetime.
+    """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
-        # Lazy import so the heavy library is only loaded when actually used.
-        from sentence_transformers import SentenceTransformer  # type: ignore
+        self._model_name = model_name
+        self._model = None  # loaded on first use
 
-        self._model = SentenceTransformer(model_name)
+    def _load(self) -> None:
+        """Load model weights from disk if not already in memory."""
+        if self._model is None:
+            # Lazy import — keeps startup fast when the embedder is
+            # constructed but never used (e.g. query on an empty store).
+            from sentence_transformers import SentenceTransformer  # type: ignore
+
+            self._model = SentenceTransformer(self._model_name)
 
     def embed(self, texts: list[str]) -> np.ndarray:
+        self._load()
         return self._model.encode(texts, convert_to_numpy=True)  # type: ignore[return-value]
 
     @property
     def dim(self) -> int:
+        self._load()
         return self._model.get_sentence_embedding_dimension()

@@ -4,10 +4,17 @@ Design
 ------
 * ``IndexFlatL2`` stores embedding vectors sequentially.  Each position *i*
   in the FAISS flat array corresponds exactly to ``_chunks[i]``.
+* Chunks are kept as raw dicts and deserialized to ``Chunk`` objects on
+  demand (lazy).  A small in-process cache avoids repeated deserialization.
 * Deletion is logical: the Python slot is set to ``None`` while the FAISS
   vector stays in place.  Search results whose slot is ``None`` are skipped.
+  A ``_has_deletions`` flag lets :meth:`search` skip the over-fetch
+  heuristic when no slots have been deleted.
+* ``_chunk_count`` tracks the live-chunk count as an O(1) integer instead
+  of scanning the list on every call.
 * ``save`` / ``load`` persist both the FAISS binary and the JSON metadata so
-  the index survives process restarts.
+  the index survives process restarts.  ``load`` stores raw dicts and never
+  deserializes all chunks up front.
 * ``needs_update`` compares stored file mtimes to decide whether to re-index.
 """
 
@@ -38,7 +45,14 @@ class KnowledgeStore:
         self.embedding_dim = embedding_dim
         self.store_dir.mkdir(parents=True, exist_ok=True)
 
-        self._chunks: list[Chunk | None] = []
+        # Raw dicts (or None tombstones).  Chunk objects are materialised
+        # lazily via _get_chunk() and cached in _chunk_cache.
+        self._chunks: list[dict | None] = []
+        self._chunk_cache: dict[int, Chunk] = {}
+
+        self._chunk_count: int = 0      # live (non-None) chunk count — O(1)
+        self._has_deletions: bool = False  # any logical deletions?
+
         self._files: dict[str, _FileRecord] = {}
         self._index: faiss.Index = faiss.IndexFlatL2(embedding_dim)
 
@@ -53,6 +67,21 @@ class KnowledgeStore:
     @property
     def _meta_path(self) -> Path:
         return self.store_dir / "meta.json"
+
+    # ------------------------------------------------------------------
+    # Internal: lazy chunk resolution
+    # ------------------------------------------------------------------
+
+    def _get_chunk(self, idx: int) -> Chunk | None:
+        """Return the ``Chunk`` at *idx*, deserialising from dict if needed."""
+        if idx < 0 or idx >= len(self._chunks):
+            return None
+        raw = self._chunks[idx]
+        if raw is None:
+            return None
+        if idx not in self._chunk_cache:
+            self._chunk_cache[idx] = Chunk.from_dict(raw)
+        return self._chunk_cache[idx]
 
     # ------------------------------------------------------------------
     # Mutation
@@ -77,8 +106,10 @@ class KnowledgeStore:
 
         for pos, chunk in zip(positions, chunks):
             chunk.chunk_id = pos
-            self._chunks.append(chunk)
+            self._chunks.append(chunk.to_dict())
+            self._chunk_cache[pos] = chunk  # cache the live object too
 
+        self._chunk_count += len(chunks)
         self._files[file_path] = _FileRecord(
             file_path=file_path, mtime=mtime, positions=positions
         )
@@ -93,8 +124,11 @@ class KnowledgeStore:
         if record is None:
             return
         for pos in record.positions:
-            if pos < len(self._chunks):
+            if pos < len(self._chunks) and self._chunks[pos] is not None:
                 self._chunks[pos] = None
+                self._chunk_cache.pop(pos, None)
+                self._chunk_count -= 1
+        self._has_deletions = True
 
     # ------------------------------------------------------------------
     # Query
@@ -107,16 +141,19 @@ class KnowledgeStore:
         if self._index.ntotal == 0:
             return []
 
-        # Fetch extra candidates to compensate for logically-deleted slots.
-        k = min(top_k * 5, self._index.ntotal)
+        # Only over-fetch when there are logical deletions that could leave
+        # gaps in the result list.  When the index is clean, fetch exactly
+        # what we need.
+        k = min(
+            top_k * 5 if self._has_deletions else top_k,
+            self._index.ntotal,
+        )
         q = query_vector.astype(np.float32).reshape(1, -1)
         distances, indices = self._index.search(q, k)
 
         results: list[tuple[Chunk, float]] = []
         for dist, idx in zip(distances[0], indices[0]):
-            if idx < 0 or idx >= len(self._chunks):
-                continue
-            chunk = self._chunks[idx]
+            chunk = self._get_chunk(idx)
             if chunk is not None:
                 results.append((chunk, float(dist)))
             if len(results) >= top_k:
@@ -137,9 +174,8 @@ class KnowledgeStore:
         faiss.write_index(self._index, str(self._index_path))
         meta = {
             "embedding_dim": self.embedding_dim,
-            "chunks": [
-                c.to_dict() if c is not None else None for c in self._chunks
-            ],
+            # _chunks already holds dicts (or None); no conversion needed.
+            "chunks": self._chunks,
             "files": {
                 k: {
                     "file_path": v.file_path,
@@ -152,7 +188,11 @@ class KnowledgeStore:
         self._meta_path.write_text(json.dumps(meta, indent=2))
 
     def load(self) -> None:
-        """Load the FAISS index and JSON metadata from disk (if present)."""
+        """Load the FAISS index and JSON metadata from disk (if present).
+
+        Chunk dicts are kept as raw dicts and only converted to ``Chunk``
+        objects on demand by :meth:`_get_chunk`.
+        """
         if not self._meta_path.exists():
             return  # fresh store, nothing to restore
 
@@ -170,10 +210,12 @@ class KnowledgeStore:
         else:
             self._index = faiss.IndexFlatL2(self.embedding_dim)
 
-        self._chunks = [
-            Chunk.from_dict(c) if c is not None else None
-            for c in meta.get("chunks", [])
-        ]
+        # Store raw dicts — no upfront deserialization.
+        self._chunks = meta.get("chunks", [])
+        self._chunk_cache = {}
+        self._chunk_count = sum(1 for c in self._chunks if c is not None)
+        self._has_deletions = any(c is None for c in self._chunks)
+
         self._files = {
             k: _FileRecord(
                 file_path=v["file_path"],
@@ -189,7 +231,7 @@ class KnowledgeStore:
 
     @property
     def total_chunks(self) -> int:
-        return sum(1 for c in self._chunks if c is not None)
+        return self._chunk_count
 
     @property
     def total_files(self) -> int:
